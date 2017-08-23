@@ -68,6 +68,7 @@
 #include <AudioToolbox/AUGraph.h>
 #endif
 
+int PerformOSCMessage(World *inWorld, int inSize, char *inData, ReplyAddress *inReply);
 
 struct SC_ScheduledEvent
 {

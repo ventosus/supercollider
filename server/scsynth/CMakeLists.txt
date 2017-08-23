@@ -33,6 +33,28 @@ if (NOT Boost_FOUND)
 	file(GLOB boost_filesystem_sources ../../external_libraries/boost/libs/filesystem/src/*cpp)
 endif()
 
+if(AUDIOAPI STREQUAL jack)
+	option(SC_JACK_USE_OSC "Use realtime OSC via Jack" ON)
+
+	if(SC_JACK_USE_OSC)
+		message(STATUS "Jack realtime OSC: enabled")
+		add_definitions(-DSC_JACK_USE_OSC)
+
+		include(CheckIncludeFiles)
+		CHECK_INCLUDE_FILES("jack/metadata.h" SC_JACK_USE_METADATA)
+
+		if(SC_JACK_USE_METADATA)
+			message(STATUS "Jack metadata API: supported")
+			add_definitions(-DSC_JACK_USE_METADATA)
+			include_directories("${PROJECT_SOURCE_DIR}/external_libraries/jackey")
+		else()
+			message(STATUS "Jack metadata API: not supported")
+		endif()
+	endif()
+else()
+	option(SC_JACK_USE_OSC "Use realtime OSC via Jack" OFF)
+endif()
+
 set(scsynth_sources
 	SC_BufGen.cpp
 

@@ -28,7 +28,10 @@
 
 enum Protocol {
 	kUDP,
-	kTCP
+	kTCP,
+#ifdef SC_JACK_USE_OSC
+	kJACK
+#endif // SC_JACK_USE_OSC
 };
 
 struct ReplyAddress
@@ -40,6 +43,9 @@ struct ReplyAddress
 
 	ReplyFunc mReplyFunc;
 	void *mReplyData;
+#ifdef SC_JACK_USE_OSC
+	int mJackOscFramePos;
+#endif // SC_JACK_USE_OSC
 };
 
 void null_reply_func(struct ReplyAddress* addr, char* msg, int size);

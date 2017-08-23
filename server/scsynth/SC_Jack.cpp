@@ -44,6 +44,14 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#ifdef SC_JACK_USE_OSC
+#	include <jack/midiport.h>
+#	ifdef SC_JACK_USE_METADATA
+#		include <jack/metadata.h>
+#		include <jackey.h>
+#	endif // SC_JACK_USE_METADATA
+#endif // SC_JACK_USE_OSC
+
 // =====================================================================
 // Constants
 
@@ -86,6 +94,26 @@ struct SC_JackPortList
 	~SC_JackPortList();
 };
 
+#ifdef SC_JACK_USE_OSC
+struct SC_JackOscPortList
+{
+	int					mSize;
+	jack_port_t**		mPorts;
+	void**	mBuffers;
+
+	jack_client_t *mClient;
+	int *mEventIndex;
+	int *mEventCount;
+
+	SC_JackOscPortList(jack_client_t *client, int numPorts, int type);
+	~SC_JackOscPortList();
+
+#	ifdef SC_JACK_USE_METADATA
+	void deactivate();
+#	endif // SC_JACK_USE_METADATA
+};
+#endif // SC_JACK_USE_OSC
+
 class SC_JackDriver : public SC_AudioDriver
 {
 	jack_client_t		*mClient;
@@ -93,6 +121,11 @@ class SC_JackDriver : public SC_AudioDriver
 	SC_JackPortList		*mOutputList;
 	double				mMaxOutputLatency;
 	SC_TimeDLL			mDLL;
+#ifdef SC_JACK_USE_OSC
+	SC_JackOscPortList *mJackOscInputList;
+	SC_JackOscPortList *mJackOscOutputList;
+	ReplyAddress mJackOscReplyAddr;
+#endif // SC_JACK_USE_OSC
 
 protected:
 	// driver interface methods
@@ -179,6 +212,62 @@ SC_JackPortList::~SC_JackPortList()
 	delete [] mBuffers;
 }
 
+#ifdef SC_JACK_USE_OSC
+// =====================================================================
+// SC_JackOscPortList
+SC_JackOscPortList::SC_JackOscPortList(jack_client_t *client, int numPorts, int type)
+	: mSize(numPorts), mPorts(0), mBuffers(0), mClient(client)
+{
+	const char *fmt = (type == JackPortIsInput ? "osc_in_%d" : "osc_out_%d");
+	const char *pretty = (type == JackPortIsInput ? "OSC Input %d" : "OSC Output %d");
+	char portname[32];
+
+	mPorts = new jack_port_t*[mSize];
+	mBuffers = new void*[mSize];
+
+	mEventCount = new int[mSize];
+	mEventIndex = new int[mSize];
+
+	for (int i = 0; i < mSize; i++) {
+		snprintf(portname, 32, fmt, i+1);
+		mPorts[i] = jack_port_register(
+					client, portname,
+					JACK_DEFAULT_MIDI_TYPE,
+					type, 0);
+		mBuffers[i] = 0;
+
+#	ifdef SC_JACK_USE_METADATA
+		jack_uuid_t uuid;
+		uuid = jack_port_uuid(mPorts[i]);
+		snprintf(portname, 32, pretty, i+1);
+		jack_set_property(client, uuid, JACK_METADATA_PRETTY_NAME, portname, "text/plain");
+		jack_set_property(client, uuid, JACKEY_EVENT_TYPES, "OSC", "text/plain");
+#	endif // SC_JACK_USE_METADATA
+	}
+}
+
+SC_JackOscPortList::~SC_JackOscPortList()
+{
+	delete [] mEventCount;
+	delete [] mEventIndex;
+
+	delete [] mPorts;
+	delete [] mBuffers;
+}
+
+#	ifdef SC_JACK_USE_METADATA
+void SC_JackOscPortList::deactivate()
+{
+	for (int i = 0; i < mSize; i++) {
+		jack_uuid_t uuid;
+		uuid = jack_port_uuid(mPorts[i]);
+		jack_remove_property(mClient, uuid, JACK_METADATA_PRETTY_NAME);
+		jack_remove_property(mClient, uuid, JACKEY_EVENT_TYPES);
+	}
+}
+#	endif // SC_JACK_USE_METADATA
+#endif // SC_JACK_USE_OSC
+
 // =====================================================================
 // JACK callbacks
 
@@ -216,6 +305,34 @@ void sc_jack_shutdown_cb(void* arg)
 	world->hw->mQuitProgram->post();
 }
 
+#ifdef SC_JACK_USE_OSC
+// =====================================================================
+// JACK OSC callbacks
+static void jack_osc_reply_func(struct ReplyAddress *addr, char* msg, int size)
+{
+	void *jackOscOutputBuffer = addr->mReplyData;
+	if(jack_midi_max_event_size(jackOscOutputBuffer) >= size)
+		jack_midi_event_write(jackOscOutputBuffer, addr->mJackOscFramePos, (const unsigned char *)msg, size);
+}
+
+static void PerformJackOSCBundle(World *inWorld, int inSize, char *inData, ReplyAddress *inReply)
+{
+	char *data = inData + 16;
+	char* dataEnd = inData + inSize;
+
+	while (data < dataEnd) {
+		int32 msgSize = sc_ntohl(*(int32*)data);
+		data += sizeof(int32);
+		// unroll nested bundles
+		if(strncmp(data, "#bundle", 8) == 0)
+			PerformJackOSCBundle(inWorld, msgSize, data, inReply);
+		else
+			PerformOSCMessage(inWorld, msgSize, data, inReply);
+		data += msgSize;
+	}
+}
+#endif // SC_JACK_USE_OSC
+
 // =====================================================================
 // SC_JackDriver (JACK)
 
@@ -232,6 +349,11 @@ SC_JackDriver::~SC_JackDriver()
 	if (mClient) {
 		jack_client_close(mClient);
 	}
+
+#ifdef SC_JACK_USE_OSC
+	delete mJackOscInputList;
+	delete mJackOscOutputList;
+#endif // SC_JACK_USE_OSC
 
 	delete mInputList;
 	delete mOutputList;
@@ -277,6 +399,14 @@ bool SC_JackDriver::DriverSetup(int* outNumSamples, double* outSampleRate)
 	// create jack I/O ports
 	mInputList = new SC_JackPortList(mClient, 0, mWorld->mNumInputs, JackPortIsInput);
 	mOutputList = new SC_JackPortList(mClient, mWorld->mNumInputs, mWorld->mNumOutputs, JackPortIsOutput);
+#ifdef SC_JACK_USE_OSC
+	// create Jack OSC I/O ports
+	mJackOscInputList = new SC_JackOscPortList(mClient, 1, JackPortIsInput);
+	mJackOscOutputList = new SC_JackOscPortList(mClient, 1, JackPortIsOutput);
+	// initialize Jack OSC Reply Address
+	mJackOscReplyAddr.mProtocol = kJACK;
+	mJackOscReplyAddr.mReplyFunc = jack_osc_reply_func;
+#endif // SC_JACK_USE_OSC
 
 	// register callbacks
 	jack_set_process_callback(mClient, sc_jack_process_cb, this);
@@ -393,6 +523,13 @@ bool SC_JackDriver::DriverStart()
 
 bool SC_JackDriver::DriverStop()
 {
+#ifdef SC_JACK_USE_OSC
+#	ifdef SC_JACK_USE_METADATA
+	mJackOscInputList->deactivate();
+	mJackOscOutputList->deactivate();
+#	endif // SC_JACK_USE_METADATA
+#endif // SC_JACK_USE_OSC
+
 	int err = 0;
 	if (mClient) err = jack_deactivate(mClient);
 	return err == 0;
@@ -479,6 +616,29 @@ void SC_JackDriver::Run()
 			outBuffers[i] = (sc_jack_sample_t*)jack_port_get_buffer(outPorts[i], numSamples);
 		}
 
+#ifdef SC_JACK_USE_OSC
+		int numJackOscPorts = mJackOscInputList->mSize;
+		jack_port_t **inJackOscPorts = mJackOscInputList->mPorts;
+		jack_port_t **outJackOscPorts = mJackOscOutputList->mPorts;
+		void **inJackOscBuffers = mJackOscInputList->mBuffers;
+		void **outJackOscBuffers = mJackOscOutputList->mBuffers;
+		int *outJackOscEventIndex = mJackOscOutputList->mEventIndex;
+		int *outJackOscEventCount = mJackOscOutputList->mEventCount;
+
+		// map Jack OSC I/O buffers
+		for(int i=0; i<numJackOscPorts; ++i) {
+			inJackOscBuffers[i] = jack_port_get_buffer(inJackOscPorts[i], numSamples);
+			outJackOscBuffers[i] = jack_port_get_buffer(outJackOscPorts[i], numSamples);
+
+			// reset event index
+			outJackOscEventIndex[i] = 0;
+			// query pending event number
+			outJackOscEventCount[i] = jack_midi_get_event_count(inJackOscBuffers[i]);
+			// clear output buffer
+			jack_midi_clear_buffer(outJackOscBuffers[i]);
+		}
+#endif // SC_JACK_USE_OSC
+
 		// main loop
 #ifdef SC_JACK_USE_DLL
 		int64 oscTime = mOSCbuftime = (int64)((mDLL.PeriodTime() - mMaxOutputLatency) * kSecondsToOSCunits + .5);
@@ -523,6 +683,35 @@ void SC_JackDriver::Run()
 				SC_ScheduledEvent event = mScheduler.Remove();
 				event.Perform();
 			}
+
+#ifdef SC_JACK_USE_OSC
+			// Jack OSC packet dispatch
+			jack_midi_event_t jev;
+			for(int i=0; i<numJackOscPorts; ++i) {
+				int count = outJackOscEventCount[i];
+				int *index = &outJackOscEventIndex[i];
+				
+				mJackOscReplyAddr.mReplyData = outJackOscBuffers[i];
+
+				for( ; *index < count; ++(*index)) {
+					jack_midi_event_get(&jev, inJackOscBuffers[i], *index);
+					if(jev.time >= bufFramePos + bufFrames)
+						break; // event is part of next control sample window
+
+					mJackOscReplyAddr.mJackOscFramePos = jev.time;
+
+					if(strncmp((char *)jev.buffer, "#buffer", 8) == 0) // is Jack OSC bundle
+						PerformJackOSCBundle(world, jev.size, (char *)jev.buffer, &mJackOscReplyAddr);
+					else if(jev.buffer[0] == '/') // is Jack OSC message
+						PerformOSCMessage(world, jev.size, (char *)jev.buffer, &mJackOscReplyAddr);
+					else // is not Jack OSC
+						; // ignore
+					
+					// reset so next command uses permanent error notification status
+					world->mLocalErrorNotification = 0;
+				}
+			}
+#endif // SC_JACK_USE_OSC
 
 			world->mSampleOffset = 0;
 			world->mSubsampleOffset = 0.f;
